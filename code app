@@ -1,0 +1,653 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Modelos de Machine Learning
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+
+# ----------------------------------------
+#  FUNÇÕES AUXILIARES DE FEATURE ENGINEERING
+# ----------------------------------------
+
+def default_or_existing(df: pd.DataFrame, col_name: str, default_value):
+    """
+    Retorna df[col_name] se existir, senão retorna uma Series de mesmo tamanho
+    preenchida com 'default_value'.
+    """
+    if col_name in df.columns:
+        return df[col_name]
+    else:
+        return pd.Series([default_value]*len(df), index=df.index)
+
+def rolling_entropy(series):
+    """
+    Calcula a entropia de Shannon em uma série categórica.
+    """
+    freq = series.value_counts(normalize=True)
+    return -np.sum(freq * np.log2(freq + 1e-9))
+
+def flag_new_value(series):
+    """
+    Marca (1) se o valor for 'novo' dentro do histórico do cliente; 0 caso contrário.
+    """
+    seen = set()
+    out = []
+    for val in series:
+        if val in seen:
+            out.append(0)
+        else:
+            out.append(1)
+            seen.add(val)
+    return out
+
+def create_50_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Cria as 50 features para prevenção de fraude.
+    Caso seu dataset não possua certas colunas, remova/edite a parte correspondente.
+    """
+
+    # =======================
+    # A) PREPARAÇÃO BÁSICA
+    # =======================
+    # 1) Unir ou criar coluna datetime, se não existir.
+    if 'transaction_date' in df.columns and 'transaction_time' in df.columns:
+        df['datetime'] = pd.to_datetime(df['transaction_date'] + ' ' + df['transaction_time'], errors='coerce')
+    elif 'datetime' in df.columns:
+        df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
+    else:
+        # Caso não tenha data/hora, assume uma fixa
+        df['datetime'] = pd.Timestamp('2023-01-01 00:00:00')
+
+    # 2) Ordenar por (customer_id, datetime)
+    df.sort_values(by=['customer_id', 'datetime'], inplace=True)
+
+    # 3) Tratar valores nulos básicos
+    df.dropna(subset=['customer_id', 'datetime', 'amount'], inplace=True)
+
+    # 4) Reindex para rolling time-based (quando precisar)
+    #    Faremos set_index e reset_index várias vezes
+    #    conforme formos criando as features que precisam de time-based rolling.
+
+    # 5) Se 'is_fraud' não existir, criar placeholder
+    if 'is_fraud' not in df.columns:
+        df['is_fraud'] = 0
+
+    # =======================
+    # B) CRIAÇÃO DAS 50 FEATURES
+    # =======================
+
+    # ----------------------------------------------------------------------------
+    # Feature 1) Frequência de transações em intervalo curto (ex.: 15 min)
+    # ----------------------------------------------------------------------------
+    df.set_index('datetime', inplace=True)
+    df['feat_01_txn_count_15min'] = (
+        df.groupby('customer_id')['transaction_id']
+          .rolling('15min').count()
+    )
+    df.reset_index(inplace=True)
+
+    # ----------------------------------------------------------------------------
+    # Feature 2) Tempo desde a última transação (min)
+    # ----------------------------------------------------------------------------
+    df['feat_02_time_since_last_txn'] = df.groupby('customer_id')['datetime'].diff().dt.total_seconds() / 60.0
+    df['feat_02_time_since_last_txn'].fillna(999999, inplace=True)
+
+    # ----------------------------------------------------------------------------
+    # Feature 3) Nº de transações acima de valor-limite (ex. R$500) nas últimas 24h
+    # ----------------------------------------------------------------------------
+    threshold_value = 500
+    df.set_index('datetime', inplace=True)
+    df['above_threshold'] = (df['amount'] > threshold_value).astype(int)
+    df['feat_03_count_above_thresh_24h'] = (
+        df.groupby('customer_id')['above_threshold']
+          .rolling('24h').sum()
+    )
+    df.reset_index(inplace=True)
+    df.drop(columns=['above_threshold'], inplace=True)
+
+    # ----------------------------------------------------------------------------
+    # Feature 4) Média móvel do valor (últimas 3 transações)
+    # ----------------------------------------------------------------------------
+    df['feat_04_rolling_mean_amt_3'] = (
+        df.groupby('customer_id')['amount']
+          .rolling(window=3, min_periods=1).mean()
+          .reset_index(level=0, drop=True)
+    )
+
+    # ----------------------------------------------------------------------------
+    # Feature 5) Desvio-padrão móvel do valor (últimas 3 transações)
+    # ----------------------------------------------------------------------------
+    df['feat_05_rolling_std_amt_3'] = (
+        df.groupby('customer_id')['amount']
+          .rolling(window=3, min_periods=1).std()
+          .reset_index(level=0, drop=True)
+    )
+    df['feat_05_rolling_std_amt_3'].fillna(0, inplace=True)
+
+    # ----------------------------------------------------------------------------
+    # Feature 6) Frequência de uso em horário incomum (madrugada)
+    # ----------------------------------------------------------------------------
+    df['hour'] = df['datetime'].dt.hour
+    df['feat_06_is_madrugada'] = df['hour'].apply(lambda x: 1 if 0 <= x < 5 else 0)
+
+    # ----------------------------------------------------------------------------
+    # Feature 7) Flag final de semana
+    # ----------------------------------------------------------------------------
+    df['day_of_week'] = df['datetime'].dt.dayofweek
+    df['feat_07_is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
+
+    # ----------------------------------------------------------------------------
+    # Feature 8) Nº transações internacionais em 24h
+    # ----------------------------------------------------------------------------
+    df['merchant_country'] = default_or_existing(df, 'merchant_country', 'BRA')
+    df['is_international'] = df['merchant_country'].apply(lambda x: 1 if x != 'BRA' else 0)
+    df.set_index('datetime', inplace=True)
+    df['feat_08_intl_24h'] = (
+        df.groupby('customer_id')['is_international']
+          .rolling('24h').sum()
+    )
+    df.reset_index(inplace=True)
+
+    # ----------------------------------------------------------------------------
+    # Feature 9) Distância geográfica (simplificada) entre transações consecutivas
+    # ----------------------------------------------------------------------------
+    # Se não tivermos lat/long, vamos apenas ver mudança de city
+    df['merchant_city'] = default_or_existing(df, 'merchant_city', 'UnknownCity')
+    df['feat_09_geo_diff'] = 0
+    for cid, sub in df.groupby('customer_id', sort=False):
+        idxs = sub.index
+        for i in range(1, len(idxs)):
+            prev_city = sub.loc[idxs[i-1], 'merchant_city']
+            curr_city = sub.loc[idxs[i], 'merchant_city']
+            df.loc[idxs[i], 'feat_09_geo_diff'] = 0 if prev_city == curr_city else 1
+
+    # ----------------------------------------------------------------------------
+    # Feature 10) Flag transação fora da região habitual (cidade mais frequente)
+    # ----------------------------------------------------------------------------
+    most_freq_city = (
+        df.groupby('customer_id')['merchant_city']
+          .agg(lambda x: x.value_counts().index[0] if len(x.value_counts())>0 else 'UnknownCity')
+          .rename('most_freq_city')
+    )
+    df = df.merge(most_freq_city, on='customer_id', how='left')
+    df['feat_10_out_of_region'] = (df['merchant_city'] != df['most_freq_city']).astype(int)
+
+    # ----------------------------------------------------------------------------
+    # Feature 11) Frequência de estornos (chargebacks)
+    # ----------------------------------------------------------------------------
+    df['is_chargeback'] = default_or_existing(df, 'is_chargeback', 0)
+    df['feat_11_chargeback_count'] = df.groupby('customer_id')['is_chargeback'].cumsum()
+
+    # ----------------------------------------------------------------------------
+    # Feature 12) Frequência de tentativas negadas
+    # ----------------------------------------------------------------------------
+    df['was_declined'] = default_or_existing(df, 'was_declined', 0)
+    df['feat_12_declined_count'] = df.groupby('customer_id')['was_declined'].cumsum()
+
+    # ----------------------------------------------------------------------------
+    # Feature 13) Razão valor atual / média do cliente
+    # ----------------------------------------------------------------------------
+    mean_amount = df.groupby('customer_id')['amount'].transform('mean')
+    df['feat_13_ratio_to_mean'] = df['amount'] / (mean_amount + 1e-9)
+
+    # ----------------------------------------------------------------------------
+    # Feature 14) Proporção de transações > 3x a média do cliente
+    # ----------------------------------------------------------------------------
+    df['above_3x_mean'] = (df['amount'] > 3 * mean_amount).astype(int)
+    df['feat_14_prop_above_3x'] = df.groupby('customer_id')['above_3x_mean'].transform('mean')
+    df.drop(columns=['above_3x_mean'], inplace=True)
+
+    # ----------------------------------------------------------------------------
+    # Feature 15) Entropia das categorias (últimas 5 transações)
+    # ----------------------------------------------------------------------------
+    df['merchant_category'] = default_or_existing(df, 'merchant_category', 'UnknownCat')
+    df.set_index('datetime', inplace=True)
+    def rolling_entropy_func(x):
+        return rolling_entropy(x)
+    df['feat_15_cat_entropy_5tx'] = (
+        df.groupby('customer_id')['merchant_category']
+          .rolling(window=5, min_periods=1)
+          .apply(rolling_entropy_func, raw=False)
+    )
+    df.reset_index(inplace=True)
+
+    # ----------------------------------------------------------------------------
+    # Feature 16) Nº de transações em categorias não habituais (top 3 cats)
+    # ----------------------------------------------------------------------------
+    top_cats = (
+        df.groupby('customer_id')['merchant_category']
+          .apply(lambda x: set(x.value_counts().head(3).index))
+          .rename('top_3_cats')
+    )
+    df = df.merge(top_cats, on='customer_id', how='left')
+    df['feat_16_unusual_cat'] = df.apply(
+        lambda row: 0 if row['merchant_category'] in row['top_3_cats'] else 1,
+        axis=1
+    )
+
+    # ----------------------------------------------------------------------------
+    # Feature 17) Tempo médio entre compras de alto valor (placeholder)
+    # ----------------------------------------------------------------------------
+    df['is_high_value'] = (df['amount'] > 500).astype(int)
+    df['feat_17_avg_time_high_value'] = 999999
+    for cid, sub in df.groupby('customer_id', sort=False):
+        last_time = None
+        times = []
+        for idx in sub.index:
+            if sub.loc[idx, 'is_high_value'] == 1:
+                if last_time is None:
+                    times.append(np.nan)
+                else:
+                    diff_min = (sub.loc[idx, 'datetime'] - last_time).total_seconds()/60.0
+                    times.append(diff_min)
+                last_time = sub.loc[idx, 'datetime']
+            else:
+                times.append(np.nan)
+        df.loc[sub.index, 'feat_17_avg_time_high_value'] = pd.Series(times, index=sub.index)
+    # média cumulativa
+    df['feat_17_avg_time_high_value'] = df.groupby('customer_id')['feat_17_avg_time_high_value'].transform(
+        lambda x: x.expanding(min_periods=2).mean()
+    )
+    df['feat_17_avg_time_high_value'].fillna(999999, inplace=True)
+
+    # ----------------------------------------------------------------------------
+    # Feature 18) Diferença entre horário da transação e horário médio do cliente
+    # ----------------------------------------------------------------------------
+    avg_hour_by_customer = df.groupby('customer_id')['hour'].transform('mean')
+    df['feat_18_diff_from_avg_hour'] = abs(df['hour'] - avg_hour_by_customer)
+
+    # ----------------------------------------------------------------------------
+    # Feature 19) Contagem de estabelecimentos novos
+    # ----------------------------------------------------------------------------
+    df['feat_19_new_merchant'] = (
+        df.groupby('customer_id')['merchant_category']
+          .transform(flag_new_value)
+    )
+
+    # ----------------------------------------------------------------------------
+    # Feature 20) Valor total gasto em 24h
+    # ----------------------------------------------------------------------------
+    df.set_index('datetime', inplace=True)
+    df['feat_20_sum_24h'] = (
+        df.groupby('customer_id')['amount']
+          .rolling('24h').sum()
+    )
+    df.reset_index(inplace=True)
+
+    # ----------------------------------------------------------------------------
+    # Feature 21) Velocidade de gasto (soma 24h / 24)
+    # ----------------------------------------------------------------------------
+    df['feat_21_spending_rate_24h'] = df['feat_20_sum_24h'] / 24.0
+
+    # ----------------------------------------------------------------------------
+    # Feature 22) Dia da semana atípico
+    # ----------------------------------------------------------------------------
+    day_counts = df.groupby(['customer_id', 'day_of_week'])['transaction_id'].count().rename('count_dw')
+    total_by_cust = day_counts.groupby('customer_id').sum().rename('total_txns')
+    day_counts = day_counts.reset_index().merge(total_by_cust, on='customer_id')
+    day_counts['ratio'] = day_counts['count_dw'] / day_counts['total_txns']
+    # dict p/ lookup
+    dw_ratio_map = {}
+    for row in day_counts.itertuples():
+        dw_ratio_map[(row.customer_id, row.day_of_week)] = row.ratio
+    def is_atypical(row):
+        ratio = dw_ratio_map.get((row['customer_id'], row['day_of_week']), 0)
+        return 1 if ratio < 0.05 else 0
+    df['feat_22_day_is_atypical'] = df.apply(is_atypical, axis=1)
+
+    # ----------------------------------------------------------------------------
+    # Feature 23) Flag de compra parcelada (se "installments" existir)
+    # ----------------------------------------------------------------------------
+    df['installments'] = default_or_existing(df, 'installments', 1)
+    df['feat_23_is_parceled'] = df['installments'].apply(lambda x: 1 if x > 1 else 0)
+
+    # ----------------------------------------------------------------------------
+    # Feature 24) Número de cartões diferentes do cliente (se 'card_id' existir)
+    # ----------------------------------------------------------------------------
+    df['card_id'] = default_or_existing(df, 'card_id', df['customer_id'])
+    df['feat_24_num_cards_by_customer'] = df.groupby('customer_id')['card_id'].transform('nunique')
+
+    # ----------------------------------------------------------------------------
+    # Feature 25) Frequência de compras online vs. presenciais (if 'is_online')
+    # ----------------------------------------------------------------------------
+    df['is_online'] = default_or_existing(df, 'is_online', 0)
+    df['feat_25_online_ratio'] = df.groupby('customer_id')['is_online'].transform('mean')
+
+    # ----------------------------------------------------------------------------
+    # Feature 26) Flag payment_method não usual
+    # ----------------------------------------------------------------------------
+    df['payment_method'] = default_or_existing(df, 'payment_method', 'unknown')
+    most_freq_method = (
+        df.groupby('customer_id')['payment_method']
+          .agg(lambda x: x.value_counts().index[0] if len(x.value_counts())>0 else 'unknown')
+          .rename('most_freq_method')
+    )
+    df = df.merge(most_freq_method, on='customer_id', how='left')
+    df['feat_26_unusual_payment_method'] = (df['payment_method'] != df['most_freq_method']).astype(int)
+
+    # ----------------------------------------------------------------------------
+    # Feature 27) Contagem de transações rejeitadas seguidas de aprovada
+    # ----------------------------------------------------------------------------
+    df['feat_27_rejected_before_approved'] = 0
+    for cid, sub in df.groupby('customer_id', sort=False):
+        was_decl = False
+        for idx in sub.index:
+            if sub.loc[idx, 'was_declined'] == 1:
+                was_decl = True
+            else:
+                if was_decl:
+                    df.loc[idx, 'feat_27_rejected_before_approved'] = 1
+                was_decl = False
+
+    # ----------------------------------------------------------------------------
+    # Feature 28) Frequência de compras com valor arredondado
+    # ----------------------------------------------------------------------------
+    def is_round_value(x):
+        return 1 if (x*100) % 100 == 0 else 0
+    df['feat_28_is_value_rounded'] = df['amount'].apply(is_round_value)
+    df['feat_28_rounded_ratio'] = df.groupby('customer_id')['feat_28_is_value_rounded'].transform('mean')
+
+    # ----------------------------------------------------------------------------
+    # Feature 29) Nº de shipping_address distintos (placeholder)
+    # ----------------------------------------------------------------------------
+    df['shipping_address'] = default_or_existing(df, 'shipping_address', 'UNKNOWN')
+    df['feat_29_unique_shipping'] = df.groupby('customer_id')['shipping_address'].transform('nunique')
+
+    # ----------------------------------------------------------------------------
+    # Feature 30) Relação chargebacks / total transações
+    # ----------------------------------------------------------------------------
+    df['feat_30_chargeback_rate'] = df.groupby('customer_id')['is_chargeback'].transform('mean')
+
+    # ----------------------------------------------------------------------------
+    # Feature 31) Múltiplas transações seguidas no mesmo estabelecimento c/ valores próximos
+    # ----------------------------------------------------------------------------
+    df['feat_31_multi_seq_same_merchant'] = 0
+    for cid, sub in df.groupby('customer_id', sort=False):
+        indices = list(sub.index)
+        for i in range(1, len(indices)):
+            curr_cat = sub.loc[indices[i], 'merchant_category']
+            prev_cat = sub.loc[indices[i-1], 'merchant_category']
+            curr_val = sub.loc[indices[i], 'amount']
+            prev_val = sub.loc[indices[i-1], 'amount']
+            if curr_cat == prev_cat and abs(curr_val - prev_val) <= 5:
+                df.loc[indices[i], 'feat_31_multi_seq_same_merchant'] = 1
+
+    # ----------------------------------------------------------------------------
+    # Feature 32) Nº de cidades diferentes em um único dia
+    # ----------------------------------------------------------------------------
+    df['date_only'] = df['datetime'].dt.date
+    group_daily_cities = df.groupby(['customer_id','date_only'])['merchant_city'].nunique().rename('daily_city_count')
+    df = df.merge(group_daily_cities, on=['customer_id','date_only'], how='left')
+    df['feat_32_cities_in_day'] = df['daily_city_count']
+    df.drop(columns=['daily_city_count'], inplace=True)
+
+    # ----------------------------------------------------------------------------
+    # Feature 33) Diferenciação de fuso horário (placeholder 'timezone')
+    # ----------------------------------------------------------------------------
+    df['timezone'] = default_or_existing(df, 'timezone', 'local')
+    df['feat_33_unusual_timezone'] = df['timezone'].apply(lambda x: 1 if x != 'local' else 0)
+
+    # ----------------------------------------------------------------------------
+    # Feature 34) Nº de transações com valor idêntico nas últimas 3 transações
+    # ----------------------------------------------------------------------------
+    df.set_index('datetime', inplace=True)
+    df['feat_34_same_value_count_3'] = (
+        df.groupby('customer_id')['amount']
+          .rolling(window=3, min_periods=1)
+          .apply(lambda x: x.value_counts().max(), raw=False)
+    )
+    df.reset_index(inplace=True)
+
+    # ----------------------------------------------------------------------------
+    # Feature 35) Soma de valores de compras recusadas (placeholder 'attempted_amount')
+    # ----------------------------------------------------------------------------
+    df['attempted_amount'] = default_or_existing(df, 'attempted_amount', 0)
+    df['feat_35_sum_declined'] = df.groupby('customer_id').apply(
+        lambda g: (g['was_declined'] * g['attempted_amount']).cumsum()
+    ).reset_index(level=0, drop=True)
+
+    # ----------------------------------------------------------------------------
+    # Feature 36) Flag de diferença de localização (city/state) consecutiva
+    # ----------------------------------------------------------------------------
+    df['merchant_state'] = default_or_existing(df, 'merchant_state', 'UnknownState')
+    df['feat_36_loc_diff'] = 0
+    for cid, sub in df.groupby('customer_id', sort=False):
+        idxs = sub.index
+        for i in range(1, len(idxs)):
+            if (sub.loc[idxs[i], 'merchant_city'] != sub.loc[idxs[i-1], 'merchant_city']
+                or sub.loc[idxs[i], 'merchant_state'] != sub.loc[idxs[i-1], 'merchant_state']):
+                df.loc[idxs[i], 'feat_36_loc_diff'] = 1
+
+    # ----------------------------------------------------------------------------
+    # Feature 37) Local de alto risco (ex.: 'betting', 'casino', 'crypto')
+    # ----------------------------------------------------------------------------
+    high_risk_cats = ['betting','casino','cryptocurrency']
+    df['feat_37_high_risk_loc'] = df['merchant_category'].apply(lambda x: 1 if str(x).lower() in high_risk_cats else 0)
+
+    # ----------------------------------------------------------------------------
+    # Feature 38) Nº de devices diferentes (se 'device_id' existe)
+    # ----------------------------------------------------------------------------
+    df['device_id'] = default_or_existing(df, 'device_id', 'unknown')
+    df['feat_38_num_devices'] = df.groupby('customer_id')['device_id'].transform('nunique')
+
+    # ----------------------------------------------------------------------------
+    # Feature 39) Tempo desde que o cliente abriu a conta/cartão (placeholder 'account_open_date')
+    # ----------------------------------------------------------------------------
+    df['account_open_date'] = default_or_existing(df, 'account_open_date', '1900-01-01')
+    df['account_open_date'] = pd.to_datetime(df['account_open_date'], errors='coerce')
+    df['feat_39_days_since_card_open'] = (df['datetime'] - df['account_open_date']).dt.days.fillna(999999)
+
+    # ----------------------------------------------------------------------------
+    # Feature 40) Data especial (ex.: Black Friday / Natal)
+    # ----------------------------------------------------------------------------
+    def is_special_date(dt):
+        # Exemplo fictício: 24-nov e 25-dez
+        if (dt.month == 11 and dt.day == 24) or (dt.month == 12 and dt.day == 25):
+            return 1
+        return 0
+    df['feat_40_special_date'] = df['datetime'].apply(is_special_date)
+
+    # ----------------------------------------------------------------------------
+    # Feature 41) Canal não usual (placeholder 'channel')
+    # ----------------------------------------------------------------------------
+    df['channel'] = default_or_existing(df, 'channel', 'web')
+    most_freq_channel = (
+        df.groupby('customer_id')['channel']
+          .agg(lambda x: x.value_counts().index[0] if len(x.value_counts())>0 else 'web')
+          .rename('most_freq_channel')
+    )
+    df = df.merge(most_freq_channel, on='customer_id', how='left')
+    df['feat_41_unusual_channel'] = (df['channel'] != df['most_freq_channel']).astype(int)
+
+    # ----------------------------------------------------------------------------
+    # Feature 42) Contagem de falha de PIN (placeholder 'pin_failed')
+    # ----------------------------------------------------------------------------
+    df['pin_failed'] = default_or_existing(df, 'pin_failed', 0)
+    df['feat_42_pin_fail_count'] = df.groupby('customer_id')['pin_failed'].cumsum()
+
+    # ----------------------------------------------------------------------------
+    # Feature 43) Relação valor / limite do cartão (placeholder 'credit_limit')
+    # ----------------------------------------------------------------------------
+    df['credit_limit'] = default_or_existing(df, 'credit_limit', 1000)
+    df['feat_43_ratio_to_limit'] = df['amount'] / (df['credit_limit'] + 1e-9)
+
+    # ----------------------------------------------------------------------------
+    # Feature 44) Valor terminando em .99
+    # ----------------------------------------------------------------------------
+    def ends_with_99(x):
+        cents = round((x - int(x)) * 100)
+        return 1 if cents == 99 else 0
+    df['feat_44_ends_99'] = df['amount'].apply(ends_with_99)
+
+    # ----------------------------------------------------------------------------
+    # Feature 45) IP usou várias contas (placeholder 'ip_address')
+    # ----------------------------------------------------------------------------
+    df['ip_address'] = default_or_existing(df, 'ip_address', '0.0.0.0')
+    ip_customer_count = df.groupby('ip_address')['customer_id'].nunique().rename('ip_cust_count')
+    df = df.merge(ip_customer_count, on='ip_address', how='left')
+    df['feat_45_ip_multi_customers'] = df['ip_cust_count']
+    df.drop(columns=['ip_cust_count'], inplace=True)
+
+    # ----------------------------------------------------------------------------
+    # Feature 46) Falta de CVV (placeholder 'cvv_present')
+    # ----------------------------------------------------------------------------
+    df['cvv_present'] = default_or_existing(df, 'cvv_present', 1)
+    df['feat_46_no_cvv'] = df['cvv_present'].apply(lambda x: 1 if x == 0 else 0)
+
+    # ----------------------------------------------------------------------------
+    # Feature 47) Frequência de cartão não presente (CNP) (placeholder 'card_not_present')
+    # ----------------------------------------------------------------------------
+    df['card_not_present'] = default_or_existing(df, 'card_not_present', 0)
+    df['feat_47_cnp_freq'] = df.groupby('customer_id')['card_not_present'].transform('mean')
+
+    # ----------------------------------------------------------------------------
+    # Feature 48) Velocidade de mudança de categoria (últimas 5 transações)
+    # ----------------------------------------------------------------------------
+    df.set_index('datetime', inplace=True)
+    df['feat_48_cat_switch_5'] = (
+        df.groupby('customer_id')['merchant_category']
+          .rolling(window=5, min_periods=1)
+          .apply(lambda x: x.nunique(), raw=False)
+    )
+    df.reset_index(inplace=True)
+
+    # ----------------------------------------------------------------------------
+    # Feature 49) Contagem de AVS mismatch (placeholder 'avs_mismatch')
+    # ----------------------------------------------------------------------------
+    df['avs_mismatch'] = default_or_existing(df, 'avs_mismatch', 0)
+    df['feat_49_avs_mismatch_cum'] = df.groupby('customer_id')['avs_mismatch'].cumsum()
+
+    # ----------------------------------------------------------------------------
+    # Feature 50) Sinal de split manual (várias transações pequenas em < 10 min)
+    # ----------------------------------------------------------------------------
+    df.set_index('datetime', inplace=True)
+    df['is_small'] = (df['amount'] < 20).astype(int)
+    df['small_10min_count'] = (
+        df.groupby('customer_id')['is_small']
+          .rolling('10min').sum()
+    )
+    df['feat_50_manual_split'] = df['small_10min_count'].apply(lambda x: 1 if x >= 3 else 0)
+    df.reset_index(inplace=True)
+
+    # Limpar colunas auxiliares que não precisamos mais
+    drop_aux_cols = [
+        'is_small','small_10min_count','ip_address','avs_mismatch','device_id',
+        'account_open_date','pin_failed','most_freq_city','top_3_cats',
+        'most_freq_method','most_freq_channel','channel','is_chargeback',
+        'was_declined','attempted_amount','shipping_address','above_3x_mean'
+    ]
+    for c in drop_aux_cols:
+        if c in df.columns:
+            df.drop(columns=[c], inplace=True)
+
+    return df
+
+
+# ----------------------------------------
+#  FUNÇÕES PARA MODELAGEM E PLOTS
+# ----------------------------------------
+def plot_confusion_matrix(cm, class_names=[0,1]):
+    fig, ax = plt.subplots()
+    cax = ax.matshow(cm)
+    plt.title("Matriz de Confusão")
+    plt.xlabel("Predição")
+    plt.ylabel("Verdadeiro")
+    for (i, j), z in np.ndenumerate(cm):
+        ax.text(j, i, str(z), ha='center', va='center')
+    st.pyplot(fig)
+
+def train_and_evaluate_model(model, X_train, y_train, X_test, y_test, model_name="Modelo"):
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    cm = confusion_matrix(y_test, y_pred)
+    report = classification_report(y_test, y_pred, output_dict=True)
+
+    st.subheader(f"Resultados - {model_name}")
+    plot_confusion_matrix(cm, class_names=[0,1])
+    st.write("**Classification Report**")
+    st.json(report)
+
+
+# ----------------------------------------
+#  APP STREAMLIT
+# ----------------------------------------
+def main():
+    st.title("Detecção de Fraude - Pipeline com 50 Features (Comparação de Modelos)")
+
+    st.write("""
+    Este aplicativo carrega um CSV de transações, cria **50 features** de fraude e
+    compara diferentes modelos de Machine Learning para classificação.
+    """)
+
+    # Sidebar
+    st.sidebar.header("Configurações")
+
+    # Upload CSV
+    uploaded_file = st.sidebar.file_uploader("Carregue o arquivo CSV", type=["csv"])
+
+    # Seleção de modelos
+    models_dict = {
+        "Logistic Regression": LogisticRegression(max_iter=1000),
+        "Decision Tree": DecisionTreeClassifier(),
+        "Random Forest": RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42),
+        "XGBoost": XGBClassifier(use_label_encoder=False, eval_metric='logloss'),
+        "LightGBM": LGBMClassifier()
+    }
+    st.sidebar.write("Selecione os modelos a serem testados:")
+    selected_models = []
+    for m_name in models_dict.keys():
+        if st.sidebar.checkbox(m_name, value=(m_name in ["Random Forest", "Decision Tree"])):
+            selected_models.append(m_name)
+
+    test_size = st.sidebar.slider("Tamanho do conjunto de teste (%)", 10, 50, 30, 5)
+    random_state = 42
+
+    if uploaded_file is not None:
+        st.write("### Visão geral dos dados (primeiras 5 linhas)")
+        df = pd.read_csv(uploaded_file)
+        st.write(df.head())
+
+        st.write("### Criando as 50 features para fraude...")
+        df_feat = create_50_features(df)
+
+        st.write("Colunas do dataset após feature engineering:")
+        st.write(df_feat.columns.tolist())
+
+        # Selecionar features (todas as que começam com 'feat_'):
+        feature_cols = [c for c in df_feat.columns if c.startswith('feat_')]
+        # Também incluir eventuais colunas numéricas importantes (se quiser)
+        # Mas vamos focar nas 50 + label
+        # A label:
+        if 'is_fraud' not in df_feat.columns:
+            st.error("Não foi encontrada a coluna 'is_fraud' no dataset. Usando placeholder = 0.")
+            df_feat['is_fraud'] = 0
+
+        df_model = df_feat.dropna(subset=feature_cols + ['is_fraud']).copy()
+        X = df_model[feature_cols].fillna(0)
+        y = df_model['is_fraud'].astype(int)
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size/100.0, stratify=y, random_state=random_state
+        )
+
+        st.write(f"Dimensão Treino: {X_train.shape} | Teste: {X_test.shape}")
+
+        if len(selected_models) == 0:
+            st.warning("Nenhum modelo selecionado.")
+        else:
+            for model_name in selected_models:
+                model = models_dict[model_name]
+                train_and_evaluate_model(model, X_train, y_train, X_test, y_test, model_name)
+    else:
+        st.warning("Por favor, faça upload de um arquivo CSV na barra lateral.")
+
+
+if __name__ == "__main__":
+    main()
