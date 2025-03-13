@@ -1,0 +1,829 @@
+mport streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import shap
+import pickle
+import plotly.express as px
+import plotly.graph_objects as go
+from io import BytesIO
+import base64
+
+from sklearn.decomposition import PCA
+from sklearn.inspection import PartialDependenceDisplay
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score, learning_curve
+from sklearn.metrics import (
+    accuracy_score, roc_auc_score, confusion_matrix, roc_curve,
+    precision_recall_curve, f1_score, precision_score, recall_score,
+    brier_score_loss, classification_report
+)
+from imblearn.over_sampling import SMOTE
+import xgboost as xgb
+from sklearn.ensemble import (
+    RandomForestClassifier, GradientBoostingClassifier,
+    AdaBoostClassifier, StackingClassifier
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.neural_network import MLPClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+
+##############################################
+# Helper: Returns appropriate SHAP explainer
+##############################################
+def get_shap_explainer(model, background_df):
+    """
+    This function returns a SHAP explainer for a given model:
+      - If model is recognized as a supported tree-based model, use TreeExplainer.
+      - Otherwise, fallback to KernelExplainer.
+    """
+    model_name = model.__class__.__name__
+    # For recognized tree-based models:
+    if model_name in ["RandomForestClassifier", "GradientBoostingClassifier", "XGBClassifier"]:
+        return shap.TreeExplainer(model)
+    else:
+        # For models like AdaBoost, MLP, SVC, etc., we fallback to KernelExplainer
+        def predict_fn(data):
+            return model.predict_proba(data)
+        return shap.KernelExplainer(predict_fn, background_df)
+
+##############################################
+# Function to Generate Report for Download (HTML)
+##############################################
+def generate_report(result_df, metrics, report_text, fig_list):
+    """Generate an HTML report with model comparison, metrics, and embedded figures."""
+    buffer = BytesIO()
+    content = "<h1>Fraud Detection Report</h1>"
+    content += "<h2>Model Comparison</h2>" + result_df.to_html()
+    content += "<h2>Additional Metrics</h2><ul>"
+    for k, v in metrics.items():
+        content += f"<li>{k}: {v:.3f}</li>"
+    content += "</ul>" + report_text
+    # Save figures to report as images (converted to base64)
+    for idx, fig in enumerate(fig_list):
+        img_buffer = BytesIO()
+        fig.savefig(img_buffer, format='png', bbox_inches="tight")
+        img_buffer.seek(0)
+        img_str = base64.b64encode(img_buffer.getvalue()).decode()
+        content += f"<h3>Figure {idx+1}</h3><img src='data:image/png;base64,{img_str}' />"
+    buffer.write(content.encode('utf-8'))
+    return buffer
+
+##############################################
+# Data Loading and Preprocessing Function
+##############################################
+@st.cache_data
+def load_data(uploaded_file):
+    data = pd.read_csv(uploaded_file)
+
+    # Drop unneeded columns
+    drop_cols = [
+        'Transaction ID',
+        'Card Holder Name',
+        'Exact Date',
+        'Transaction Date',
+        'Transaction Time',
+        'Currency',
+        'Card Number'
+    ]
+    data.drop(columns=drop_cols, inplace=True, errors='ignore')
+
+    # Encode categorical columns
+    cat_cols = [
+        'Merchant ID', 'Capture Method', 'Payment Method', 'Card Brand',
+        'Issuer Bank', 'Issuer Country', 'Transaction Status', 'Transaction Type',
+        'Merchant City', 'Merchant State'
+    ]
+    for col in cat_cols:
+        if col in data.columns:
+            le = LabelEncoder()
+            data[col] = le.fit_transform(data[col].astype(str))
+
+    # Scale numeric columns
+    num_cols = ['Amount', 'Installments', 'Merchant Category Code (MCC)']
+    for col in num_cols:
+        if col in data.columns:
+            data[col] = StandardScaler().fit_transform(data[[col]])
+
+    return data
+
+##############################################
+# Utility: record_explanation function for LIME
+##############################################
+def record_explanation(instance_id, explanation):
+    if 'explanation_history' not in st.session_state:
+        st.session_state['explanation_history'] = {}
+    st.session_state['explanation_history'][instance_id] = explanation
+
+##############################################
+# Sidebar Navigation
+##############################################
+st.sidebar.title("Navigation")
+page = st.sidebar.radio(
+    "Select Section:",
+    (
+        "Data Upload & EDA",
+        "Modeling & Performance",
+        "Advanced Visualizations",
+        "Advanced Feature Engineering",
+        "Dynamic Hyperparameter Tuning",
+        "Advanced Explainability",
+        "Interactive Explainability & Model Comparison",
+        "Export Report",
+        "Advanced What-if Simulation",
+        "Advanced Interpretability Visualizations",
+        "Additional Evaluation Metrics"
+    )
+)
+
+##############################################
+# Section 1: Data Upload & EDA
+##############################################
+if page == "Data Upload & EDA":
+    st.title("Data Upload & Exploratory Data Analysis")
+    st.markdown(
+        "Upload your CSV file with the column Fraud Indicator. Others can be optional."
+    )
+    uploaded_file = st.file_uploader("Choose CSV file", type=["csv"])
+
+    if uploaded_file is not None:
+        data = load_data(uploaded_file)
+        st.session_state['data'] = data
+        st.subheader("Data Preview")
+        st.write(data.head())
+        st.subheader("Data Description")
+        st.write(data.describe())
+
+        if 'Fraud Indicator' in data.columns:
+            st.write("Value Counts of Fraud Indicator:")
+            st.write(data['Fraud Indicator'].value_counts())
+        else:
+            st.warning("'Fraud Indicator' column not found. Please ensure it exists.")
+    else:
+        st.info("Please upload the CSV file to continue.")
+
+##############################################
+# Section 2: Modeling & Performance
+##############################################
+if page == "Modeling & Performance":
+    st.title("Modeling & Performance")
+    if 'data' not in st.session_state:
+        st.error("Please upload the data first!")
+    else:
+        data = st.session_state['data']
+        if 'Fraud Indicator' not in data.columns:
+            st.error("Column 'Fraud Indicator' not found in dataset.")
+        else:
+            X = data.drop(columns=['Fraud Indicator'])
+            y = data['Fraud Indicator']
+
+            # SMOTE
+            smote = SMOTE(random_state=42)
+            X_res, y_res = smote.fit_resample(X, y)
+            X_train, X_test, y_train, y_test = train_test_split(X_res, y_res, test_size=0.2, random_state=42)
+
+            # RandomForest dynamic parameters
+            st.sidebar.subheader("RandomForest Parameters")
+            n_estimators = st.sidebar.slider("Number of Trees", 50, 500, 200, step=50)
+            max_depth = st.sidebar.slider("Max Depth", 1, 20, 5)
+
+            # Several models
+            models = {
+                "XGBoost": xgb.XGBClassifier(objective='binary:logistic', eval_metric='auc',
+                                             use_label_encoder=False, random_state=42),
+                "RandomForest": RandomForestClassifier(n_estimators=n_estimators, max_depth=max_depth, random_state=42),
+                "GradientBoosting": GradientBoostingClassifier(n_estimators=200, random_state=42),
+                "AdaBoost": AdaBoostClassifier(n_estimators=200, random_state=42),
+                "LogisticRegression": LogisticRegression(max_iter=1000, random_state=42),
+                "SVC": SVC(probability=True, random_state=42),
+                "MLP": MLPClassifier(hidden_layer_sizes=(100,), max_iter=500, random_state=42),
+                "GaussianNB": GaussianNB()
+            }
+
+            results = []
+            best_model = None
+            best_auc = 0
+
+            for name, model in models.items():
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_test)
+                try:
+                    y_proba = model.predict_proba(X_test)[:, 1]
+                except:
+                    y_proba = model.decision_function(X_test)
+                auc = roc_auc_score(y_test, y_proba)
+                acc = accuracy_score(y_test, y_pred)
+                results.append({"Model": name, "Accuracy": acc, "AUC-ROC": auc})
+                if auc > best_auc:
+                    best_auc = auc
+                    best_model = model
+
+            result_df = pd.DataFrame(results)
+            st.write("Model Comparison Table:")
+            st.dataframe(result_df)
+
+            cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+            cv_auc_scores = cross_val_score(best_model, X, y, scoring='roc_auc', cv=cv)
+            st.write("Cross-Validated AUC of Best Model:", np.mean(cv_auc_scores))
+
+            st.session_state['X_train'] = X_train
+            st.session_state['X_test'] = X_test
+            st.session_state['y_test'] = y_test
+            st.session_state['best_model'] = best_model
+            st.session_state['result_df'] = result_df
+
+##############################################
+# Section 3: Advanced Visualizations
+##############################################
+if page == "Advanced Visualizations":
+    st.title("Advanced Visualizations")
+    if 'X_test' not in st.session_state:
+        st.error("Please finish the 'Modeling & Performance' section first!")
+    else:
+        X_test = st.session_state['X_test']
+        y_test = st.session_state['y_test']
+        chosen_model = st.session_state['best_model']  # or pick any model
+        X_train = st.session_state['X_train']
+
+        figs_to_report = []
+
+        st.subheader("Confusion Matrix")
+        fig, ax = plt.subplots(figsize=(6, 4))
+        cm = confusion_matrix(y_test, chosen_model.predict(X_test))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
+                    xticklabels=["Non-Fraud", "Fraud"],
+                    yticklabels=["Non-Fraud", "Fraud"])
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("Actual")
+        st.pyplot(fig)
+        figs_to_report.append(fig)
+
+        st.subheader("Interactive ROC Curve")
+        y_proba_best = chosen_model.predict_proba(X_test)[:, 1]
+        fpr, tpr, _ = roc_curve(y_test, y_proba_best)
+        roc_fig = go.Figure()
+        roc_fig.add_trace(go.Scatter(x=fpr, y=tpr, mode='lines', name='ROC Curve'))
+        roc_fig.add_trace(go.Scatter(x=[0,1], y=[0,1], mode='lines', name='Baseline', line=dict(dash='dash')))
+        roc_fig.update_layout(title="ROC Curve", xaxis_title="False Positive Rate", yaxis_title="True Positive Rate")
+        st.plotly_chart(roc_fig)
+
+        st.subheader("Calibration Curve")
+        prob_bins = np.linspace(0, 1, 11)
+        bin_ids = np.digitize(y_proba_best, prob_bins) - 1
+        bin_true = [y_test[bin_ids == i].mean() if np.sum(bin_ids == i) > 0 else np.nan for i in range(len(prob_bins))]
+        calib_fig = px.line(x=prob_bins, y=bin_true, markers=True,
+                            labels={'x': 'Predicted Probability', 'y': 'Observed Frequency'})
+        calib_fig.add_scatter(x=[0,1], y=[0,1], mode='lines', name='Ideal', line=dict(dash='dash'))
+        calib_fig.update_layout(title="Calibration Curve")
+        st.plotly_chart(calib_fig)
+
+        st.subheader("Cumulative Accuracy Profile (CAP)")
+        df_cap = pd.DataFrame({"y_true": y_test, "y_proba": y_proba_best})
+        df_cap.sort_values(by="y_proba", ascending=False, inplace=True)
+        df_cap["cum_true"] = df_cap["y_true"].cumsum()
+        df_cap["cum_total"] = np.arange(1, len(df_cap)+1)
+        total_pos = df_cap["y_true"].sum()
+        df_cap["gain"] = df_cap["cum_true"] / total_pos
+        cap_fig = go.Figure()
+        cap_fig.add_trace(go.Scatter(x=np.linspace(0, 1, len(df_cap)), y=df_cap["gain"], mode='lines', name="CAP"))
+        cap_fig.add_trace(go.Scatter(x=[0,1], y=[0,1], mode='lines', name="Baseline", line=dict(dash='dash')))
+        cap_fig.update_layout(title="Cumulative Accuracy Profile", xaxis_title="Percentile", yaxis_title="Gain")
+        st.plotly_chart(cap_fig)
+
+        st.subheader("Distribution of Predicted Scores")
+        dist_fig = px.histogram(
+            x=y_proba_best,
+            nbins=50,
+            labels={'x': "Probability of Fraud"},
+            title="Histogram of Predicted Scores"
+        )
+        st.plotly_chart(dist_fig)
+
+        st.subheader("Performance Dashboard")
+        st.write("Model metrics comparison:")
+        st.dataframe(st.session_state.get('result_df', pd.DataFrame()))
+
+        # SHAP fallback for AdaBoost (or any model not supported by TreeExplainer)
+        st.subheader("SHAP Summary Plot (Beeswarm & Bar)")
+        # sampling a background for fallback
+        background_df = X_train.sample(n=min(100, len(X_train)), random_state=42)
+
+        # get_shap_explainer picks TreeExplainer if possible, else Kernel
+        def get_shap_explainer(model, background):
+            model_name = model.__class__.__name__
+            if model_name in ["RandomForestClassifier", "GradientBoostingClassifier", "XGBClassifier"]:
+                return shap.TreeExplainer(model)
+            else:
+                def predict_fn(data):
+                    return model.predict_proba(data)
+                return shap.KernelExplainer(predict_fn, background)
+
+        explainer = get_shap_explainer(chosen_model, background_df)
+        shap_values = explainer(X_test)
+
+        max_points = 3000
+        if len(X_test) > max_points:
+            X_test_sample = X_test.sample(n=max_points, random_state=42)
+            shap_values_sample = shap_values[[i for i in X_test_sample.index]]
+        else:
+            X_test_sample = X_test
+            shap_values_sample = shap_values
+
+        st.markdown("**Beeswarm Plot (sampled if needed)**")
+        shap.summary_plot(shap_values_sample, X_test_sample, max_display=15, show=False)
+        fig_beeswarm = plt.gcf()
+        st.pyplot(fig_beeswarm, bbox_inches="tight")
+        plt.clf()
+
+        st.markdown("---")
+        st.markdown("**Bar Plot (average impact)**")
+        shap.summary_plot(shap_values, X_test, plot_type="bar", max_display=15, show=False)
+        fig_bar = plt.gcf()
+        st.pyplot(fig_bar, bbox_inches="tight")
+        plt.clf()
+
+##############################################
+# 4: Advanced Feature Engineering
+##############################################
+if page == "Advanced Feature Engineering":
+    st.title("Advanced Feature Engineering & Selection")
+    if 'data' not in st.session_state:
+        st.error("Please upload the data first!")
+    else:
+        data = st.session_state['data']
+        st.subheader("Select Features for Modeling")
+        if 'Fraud Indicator' not in data.columns:
+            st.error("Column 'Fraud Indicator' not found.")
+        else:
+            all_features = list(data.columns)
+            required_columns = ['Fraud Indicator']
+            selectable = [col for col in all_features if col not in required_columns]
+            selected_features = st.multiselect("Select variables", selectable, default=selectable)
+            if len(selected_features) == 0:
+                st.error("Please select at least one variable.")
+            else:
+                st.write("Selected Features:", selected_features)
+                st.subheader("Correlation Heatmap")
+                fig, ax = plt.subplots(figsize=(10,8))
+                corr_mat = data[selected_features + ['Fraud Indicator']].corr()
+                sns.heatmap(corr_mat, annot=True, fmt=".2f", cmap="coolwarm", ax=ax)
+                st.pyplot(fig)
+
+                st.subheader("PCA - Principal Component Analysis")
+                pca = PCA(n_components=2)
+                df_no_na = data[selected_features].dropna()
+                pca_result = pca.fit_transform(df_no_na)
+                pca_df = pd.DataFrame(data=pca_result, columns=["PC1", "PC2"])
+                pca_fig = px.scatter(pca_df, x="PC1", y="PC2", title="PCA of Selected Data")
+                st.plotly_chart(pca_fig)
+
+##############################################
+# 5: Dynamic Hyperparameter Tuning
+##############################################
+if page == "Dynamic Hyperparameter Tuning":
+    st.title("Dynamic Hyperparameter Tuning")
+    if 'data' not in st.session_state:
+        st.error("Please upload data first!")
+    else:
+        data = st.session_state['data']
+        if 'Fraud Indicator' not in data.columns:
+            st.error("Column 'Fraud Indicator' not found.")
+        else:
+            X = data.drop(columns=['Fraud Indicator'])
+            y = data['Fraud Indicator']
+            smote = SMOTE(random_state=42)
+            X_res, y_res = smote.fit_resample(X, y)
+            X_res = pd.DataFrame(X_res, columns=X.columns)
+            X_train, X_test, y_train, y_test = train_test_split(X_res, y_res, test_size=0.2, random_state=42)
+
+            st.subheader("Hyperparameter Tuning for RandomForest")
+            n_estimators = st.slider("Number of Trees", 50, 500, 200, step=50)
+            max_depth = st.slider("Max Depth", 1, 20, 5)
+
+            model = RandomForestClassifier(n_estimators=n_estimators, max_depth=max_depth, random_state=42)
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_test)
+            try:
+                y_proba = model.predict_proba(X_test)[:,1]
+            except:
+                y_proba = model.decision_function(X_test)
+            auc = roc_auc_score(y_test, y_proba)
+            st.write(f"Model AUC: {auc:.3f}")
+
+            st.subheader("Learning Curve")
+            train_sizes_vals, train_scores, test_scores = learning_curve(
+                model, X_train, y_train, cv=5, n_jobs=-1, train_sizes=np.linspace(0.1, 1.0, 5)
+            )
+            train_mean = np.mean(train_scores, axis=1)
+            test_mean = np.mean(test_scores, axis=1)
+            fig, ax = plt.subplots()
+            ax.plot(train_sizes_vals, train_mean, 'o-', label="Training Score")
+            ax.plot(train_sizes_vals, test_mean, 'o-', label="Validation Score")
+            ax.set_xlabel("Training Size")
+            ax.set_ylabel("Score")
+            ax.set_title("Learning Curve")
+            ax.legend()
+            st.pyplot(fig)
+
+##############################################
+# 6: Advanced Explainability
+##############################################
+if page == "Advanced Explainability":
+    st.title("Advanced Model Explainability")
+    if 'X_test' not in st.session_state:
+        st.error("Please complete modeling first!")
+    else:
+        X_test = st.session_state['X_test']
+        chosen_model = st.session_state['best_model']
+        X_train = st.session_state['X_train']
+
+        st.subheader("SHAP Dependence Plot")
+        # Fallback logic: try TreeExplainer, otherwise KernelExplainer
+        def get_fallback_explainer(model, background):
+            model_name = model.__class__.__name__
+            if model_name in ["RandomForestClassifier", "GradientBoostingClassifier", "XGBClassifier"]:
+                return shap.TreeExplainer(model)
+            else:
+                def predict_fn(data):
+                    return model.predict_proba(data)
+                return shap.KernelExplainer(predict_fn, background)
+
+        background_df = X_train.sample(n=min(100, len(X_train)), random_state=42)
+        explainer = get_fallback_explainer(chosen_model, background_df)
+        shap_values = explainer(X_test)
+
+        feature = st.selectbox("Select a feature for Dependence Plot", X_test.columns)
+        shap.dependence_plot(feature, shap_values, X_test, show=False)
+        fig_dep = plt.gcf()
+        st.pyplot(fig_dep, bbox_inches="tight")
+        plt.clf()
+
+        st.subheader("SHAP Force Plot for a Single Instance")
+        instance_index = st.slider("Select instance for Force Plot", 0, X_test.shape[0]-1, 0)
+        force_fig = shap.force_plot(explainer.expected_value, shap_values[instance_index],
+                                    X_test.iloc[instance_index], matplotlib=True, show=False)
+        st.pyplot(force_fig, bbox_inches="tight")
+        plt.clf()
+
+        st.subheader("Local Explanation with LIME and Record History")
+        try:
+            import lime
+            import lime.lime_tabular
+            lime_explainer = lime.lime_tabular.LimeTabularExplainer(
+                X_train.values, feature_names=X_train.columns,
+                class_names=["Non-Fraud", "Fraud"], discretize_continuous=True
+            )
+            i = st.slider("Select instance for LIME explanation", 0, X_test.shape[0]-1, 0)
+            exp = lime_explainer.explain_instance(X_test.iloc[i].values, chosen_model.predict_proba, num_features=10)
+            st.write("LIME Explanation:", exp.as_list())
+            record_explanation(i, exp.as_list())
+            st.subheader("Explanation History")
+            st.write(st.session_state.get('explanation_history', {}))
+        except ImportError:
+            st.info("LIME is not installed. Use 'pip install lime' to enable LIME explanations.")
+
+##############################################
+# 7: Interactive Explainability & Model Comparison
+##############################################
+if page == "Interactive Explainability & Model Comparison":
+    st.title("Interactive Explainability & Model Comparison")
+    if 'models' not in st.session_state:
+        st.session_state['models'] = {}
+    if 'best_model' not in st.session_state:
+        st.error("Please complete 'Modeling & Performance' first!")
+    else:
+        # Add best_model to models for comparison, or you can register them individually
+        if "BestModel" not in st.session_state['models']:
+            st.session_state['models']["BestModel"] = st.session_state['best_model']
+
+        models_available = list(st.session_state['models'].keys())
+        selected_models = st.multiselect("Select models for comparison", models_available)
+        if selected_models:
+            X_test = st.session_state['X_test']
+            X_train = st.session_state['X_train']
+            col_expl = st.columns(len(selected_models))
+
+            def get_model_explainer(model, background):
+                name = model.__class__.__name__
+                if name in ["RandomForestClassifier", "GradientBoostingClassifier", "XGBClassifier"]:
+                    return shap.TreeExplainer(model)
+                elif name == "SVC":
+                    return shap.KernelExplainer(model.predict_proba, background)
+                else:
+                    def predict_fn(data):
+                        return model.predict_proba(data)
+                    return shap.KernelExplainer(predict_fn, background)
+
+            for idx, model_key in enumerate(selected_models):
+                model = st.session_state['models'][model_key]
+                # sample background to avoid heavy KernelExplainer
+                background_df = X_train.sample(n=min(100, len(X_train)), random_state=42)
+                explainer = get_model_explainer(model, background_df)
+                shap_values = explainer(X_test)
+                with col_expl[idx]:
+                    st.subheader(f"SHAP Summary - {model_key}")
+                    shap.summary_plot(shap_values, X_test, max_display=10, show=False)
+                    st.pyplot(plt.gcf(), bbox_inches="tight")
+                    plt.clf()
+
+##############################################
+# 8: Export Report
+##############################################
+if page == "Export Report":
+    st.title("Export Report")
+    if 'result_df' not in st.session_state or 'best_model' not in st.session_state:
+        st.error("Please complete modeling before generating the report!")
+    else:
+        metrics = {}
+        if 'y_test' in st.session_state and 'X_test' in st.session_state:
+            y_test = st.session_state['y_test']
+            X_test = st.session_state['X_test']
+            chosen_model = st.session_state['best_model']
+            try:
+                proba = chosen_model.predict_proba(X_test)[:,1]
+            except:
+                proba = chosen_model.decision_function(X_test)
+            metrics["AUC"] = roc_auc_score(y_test, proba)
+            sorted_preds = np.sort(proba)
+            cum = np.linspace(0,1,len(sorted_preds))
+            metrics["KS"] = np.max(np.abs(cum - np.sort(proba)))
+
+        report_text = "<p>This report was generated from the Fraud Detection Dashboard.</p>"
+        figs_list = []
+        st.markdown("Click the button below to download the HTML report.")
+        report_buffer = generate_report(
+            st.session_state.get('result_df', pd.DataFrame()),
+            metrics, report_text, figs_list
+        )
+        st.download_button("Download Report", data=report_buffer,
+                           file_name="fraud_detection_report.html", mime="text/html")
+
+##############################################
+# 9: Advanced What-if Simulation
+##############################################
+if page == "Advanced What-if Simulation":
+    st.title("Advanced What-if Simulation")
+    if 'X_test' not in st.session_state or 'best_model' not in st.session_state:
+        st.error("Please complete modeling first!")
+    else:
+        X_test = st.session_state['X_test']
+        chosen_model = st.session_state['best_model']
+
+        st.markdown("### Multiple Scenario Simulation")
+        num_scenarios = st.number_input("Number of scenarios to simulate",
+                                        min_value=1, max_value=5, value=1)
+        scenarios = []
+
+        if "Amount" not in X_test.columns:
+            st.warning("Column 'Amount' not found. Example scenario features won't be displayed.")
+        if "Installments" not in X_test.columns:
+            st.warning("Column 'Installments' not found. Example scenario features won't be displayed.")
+
+        for i in range(num_scenarios):
+            st.markdown(f"#### Scenario {i+1}")
+            amount_input = 0.0
+            installments_input = 0
+            if "Amount" in X_test.columns:
+                amount_input = st.number_input(f"Scenario {i+1} - Amount",
+                                               value=float(X_test["Amount"].mean()),
+                                               key=f"amount_{i}")
+            if "Installments" in X_test.columns:
+                installments_input = st.number_input(f"Scenario {i+1} - Installments",
+                                                     value=int(X_test["Installments"].mean()),
+                                                     key=f"inst_{i}")
+
+            scenario_instance = X_test.iloc[0].copy()
+            if "Amount" in scenario_instance.index:
+                scenario_instance["Amount"] = amount_input
+            if "Installments" in scenario_instance.index:
+                scenario_instance["Installments"] = installments_input
+
+            scenarios.append(scenario_instance)
+
+        st.markdown("### Predicted Fraud Probabilities for Each Scenario")
+        for idx, scenario in enumerate(scenarios):
+            scenario_df = pd.DataFrame([scenario], columns=X_test.columns)
+            proba = chosen_model.predict_proba(scenario_df)[:, 1][0]
+            st.write(f"Scenario {idx+1}: Predicted Fraud Probability = {proba:.2f}")
+
+        st.markdown("### Sensitivity Analysis - Visual Feedback")
+        feature_list = list(X_test.columns)
+        if len(feature_list) > 0:
+            feature = st.selectbox("Select feature for sensitivity analysis", feature_list)
+            instance_ref = X_test.iloc[0].copy()
+            base_val = instance_ref[feature]
+            values = np.linspace(base_val - 3, base_val + 3, 20)
+            probas = []
+            for val in values:
+                instance_temp = instance_ref.copy()
+                instance_temp[feature] = val
+                instance_df = pd.DataFrame([instance_temp], columns=X_test.columns)
+                p = chosen_model.predict_proba(instance_df)[:, 1][0]
+                probas.append(p)
+            sens_fig = go.Figure()
+            sens_fig.add_trace(go.Scatter(x=values, y=probas, mode='lines+markers', name='Sensitivity'))
+            sens_fig.update_layout(title=f"Sensitivity of Prediction to {feature}",
+                                   xaxis_title=feature,
+                                   yaxis_title="Predicted Fraud Probability")
+            st.plotly_chart(sens_fig)
+
+##############################################
+# 10: Advanced Interpretability Visualizations
+##############################################
+if page == "Advanced Interpretability Visualizations":
+    st.title("Advanced Interpretability Visualizations")
+    if 'X_test' not in st.session_state or 'best_model' not in st.session_state:
+        st.error("Please complete modeling first!")
+    else:
+        X_test = st.session_state['X_test']
+        chosen_model = st.session_state['best_model']
+        X_train = st.session_state['X_train']
+        y_test = st.session_state['y_test']
+
+        st.header("Partial Dependence Plot (PDP) and ICE")
+        features_list = list(X_test.columns)
+        features_selected = st.multiselect(
+            "Select features for PDP/ICE",
+            features_list,
+            default=[features_list[0]] if features_list else []
+        )
+        if features_selected:
+            try:
+                disp = PartialDependenceDisplay.from_estimator(
+                    chosen_model, X_test, features_selected,
+                    kind="both", subsample=50, grid_resolution=20
+                )
+                st.pyplot(disp.figure_, bbox_inches="tight")
+            except Exception as e:
+                st.error(f"Error generating PDP/ICE: {e}")
+
+        st.header("Waterfall Chart for a Single Prediction")
+        if X_test.shape[0] > 0:
+            instance_idx = st.slider("Select instance for Waterfall Chart", 0, X_test.shape[0]-1, 0)
+            st.markdown("Waterfall Chart for the selected instance:")
+            try:
+                # fallback approach for SHAP
+                def get_any_explainer(m, bg):
+                    n = m.__class__.__name__
+                    if n in ["RandomForestClassifier", "GradientBoostingClassifier", "XGBClassifier"]:
+                        return shap.TreeExplainer(m)
+                    else:
+                        def predict_fn(data):
+                            return m.predict_proba(data)
+                        return shap.KernelExplainer(predict_fn, bg)
+
+                background_df = X_train.sample(n=min(100, len(X_train)), random_state=42)
+                explainer = get_any_explainer(chosen_model, background_df)
+                shap_values = explainer(X_test)
+                shap.waterfall_plot(shap_values[instance_idx])
+                fig_waterfall = plt.gcf()
+                st.pyplot(fig_waterfall, bbox_inches="tight")
+                plt.clf()
+            except Exception as e:
+                st.error(f"Error generating Waterfall Chart: {e}")
+
+        st.header("Permutation Feature Importance")
+        from sklearn.inspection import permutation_importance
+        result = permutation_importance(chosen_model, X_test, y_test, n_repeats=10,
+                                        random_state=42, scoring='roc_auc')
+        sorted_idx = result.importances_mean.argsort()
+        fig_perm, ax_perm = plt.subplots()
+        ax_perm.boxplot(result.importances[sorted_idx].T, vert=False, labels=X_test.columns[sorted_idx])
+        ax_perm.set_title("Permutation Feature Importance")
+        st.pyplot(fig_perm, bbox_inches="tight")
+        plt.clf()
+
+        st.header("Interactive Dashboard with Dynamic Filters")
+        st.markdown("Use filters below to visualize subsets of test data and predictions.")
+        if "Amount" in X_test.columns:
+            amt_min, amt_max = float(X_test["Amount"].min()), float(X_test["Amount"].max())
+            amt_range = st.slider("Amount Range", amt_min, amt_max, (amt_min, amt_max))
+        else:
+            amt_range = (None, None)
+        if "Installments" in X_test.columns:
+            inst_min, inst_max = int(X_test["Installments"].min()), int(X_test["Installments"].max())
+            inst_range = st.slider("Installments Range", inst_min, inst_max, (inst_min, inst_max))
+        else:
+            inst_range = (None, None)
+        filtered_data = X_test.copy()
+        if amt_range[0] is not None:
+            filtered_data = filtered_data[
+                (filtered_data["Amount"] >= amt_range[0]) &
+                (filtered_data["Amount"] <= amt_range[1])
+            ]
+        if inst_range[0] is not None:
+            filtered_data = filtered_data[
+                (filtered_data["Installments"] >= inst_range[0]) &
+                (filtered_data["Installments"] <= inst_range[1])
+            ]
+        st.write("Filtered Test Data (first 5 rows):", filtered_data.head())
+        if not filtered_data.empty:
+            proba_filtered = chosen_model.predict_proba(filtered_data)[:,1]
+            fig_filter = px.histogram(
+                x=proba_filtered, nbins=30,
+                labels={'x': "Predicted Fraud Probability"},
+                title="Prediction Distribution for Filtered Data"
+            )
+            st.plotly_chart(fig_filter)
+
+        st.header("Multivariate Sensitivity Analysis (Heatmap)")
+        st.markdown("Select two features to see how they interact.")
+        if len(X_test.columns) >= 2:
+            feat1 = st.selectbox("Select first feature", X_test.columns, index=0)
+            feat2 = st.selectbox("Select second feature", X_test.columns, index=1)
+            feat1_vals = np.linspace(X_test[feat1].quantile(0.05), X_test[feat1].quantile(0.95), 20)
+            feat2_vals = np.linspace(X_test[feat2].quantile(0.05), X_test[feat2].quantile(0.95), 20)
+            heatmap_data = np.zeros((len(feat2_vals), len(feat1_vals)))
+            instance_base = X_test.iloc[0].copy()
+            for i, val1 in enumerate(feat1_vals):
+                for j, val2 in enumerate(feat2_vals):
+                    instance_temp = instance_base.copy()
+                    instance_temp[feat1] = val1
+                    instance_temp[feat2] = val2
+                    df_instance = pd.DataFrame([instance_temp], columns=X_test.columns)
+                    pred = chosen_model.predict_proba(df_instance)[:, 1][0]
+                    heatmap_data[j, i] = pred
+            fig_heat = px.imshow(
+                heatmap_data, x=feat1_vals, y=feat2_vals,
+                labels={'x': feat1, 'y': feat2, 'color': "Predicted Fraud Probability"},
+                title="Multivariate Sensitivity Analysis"
+            )
+            st.plotly_chart(fig_heat)
+
+##############################################
+# 11: Additional Evaluation Metrics
+##############################################
+if page == "Additional Evaluation Metrics":
+    st.title("Additional Evaluation Metrics")
+    if 'X_test' not in st.session_state or 'y_test' not in st.session_state or 'best_model' not in st.session_state:
+        st.error("Please complete modeling first!")
+    else:
+        X_test = st.session_state['X_test']
+        y_test = st.session_state['y_test']
+        chosen_model = st.session_state['best_model']
+
+        st.header("Lift Curve")
+        y_proba = chosen_model.predict_proba(X_test)[:,1]
+        sorted_idx = np.argsort(-y_proba)
+        sorted_y = y_test.iloc[sorted_idx].reset_index(drop=True)
+        cum_positives = np.cumsum(sorted_y)
+        total_positives = sorted_y.sum()
+        percentile = np.linspace(1/len(sorted_y), 1.0, len(sorted_y))
+        gain = cum_positives / total_positives
+        lift = gain / percentile
+        fig_lift, ax_lift = plt.subplots()
+        ax_lift.plot(percentile, lift, label='Lift Curve')
+        ax_lift.set_xlabel("Percentile")
+        ax_lift.set_ylabel("Lift")
+        ax_lift.set_title("Lift Curve")
+        st.pyplot(fig_lift, bbox_inches="tight")
+        plt.clf()
+
+        st.header("Learning Curve with Bias/Variance Analysis")
+        train_sizes_vals, train_scores, test_scores = learning_curve(
+            chosen_model, X_test, y_test, cv=5,
+            train_sizes=np.linspace(0.1, 1.0, 5)
+        )
+        train_std = np.std(train_scores, axis=1)
+        test_std = np.std(test_scores, axis=1)
+        fig_lv, ax_lv = plt.subplots()
+        ax_lv.plot(train_sizes_vals, np.mean(train_scores, axis=1), 'o-', color="r", label="Training Score")
+        ax_lv.fill_between(
+            train_sizes_vals,
+            np.mean(train_scores, axis=1) - train_std,
+            np.mean(train_scores, axis=1) + train_std,
+            alpha=0.2, color="r"
+        )
+        ax_lv.plot(train_sizes_vals, np.mean(test_scores, axis=1), 'o-', color="g", label="Validation Score")
+        ax_lv.fill_between(
+            train_sizes_vals,
+            np.mean(test_scores, axis=1) - test_std,
+            np.mean(test_scores, axis=1) + test_std,
+            alpha=0.2, color="g"
+        )
+        ax_lv.set_xlabel("Training Size")
+        ax_lv.set_ylabel("Score")
+        ax_lv.set_title("Learning Curve with Bias-Variance Analysis")
+        ax_lv.legend()
+        st.pyplot(fig_lv, bbox_inches="tight")
+        plt.clf()
+
+        st.header("Bootstrap Confidence Intervals for Mean Predictions")
+        n_bootstraps = 100
+        boot_means = []
+        rng = np.random.RandomState(42)
+        for i in range(n_bootstraps):
+            indices = rng.choice(range(len(X_test)), size=len(X_test), replace=True)
+            boot_X = X_test.iloc[indices]
+            boot_pred = chosen_model.predict_proba(boot_X)[:,1]
+            boot_means.append(np.mean(boot_pred))
+        boot_means = np.array(boot_means)
+        ci_lower = np.percentile(boot_means, 2.5)
+        ci_upper = np.percentile(boot_means, 97.5)
+        st.write(
+            f"Predictions Mean Confidence Interval (95%): [{ci_lower:.3f}, {ci_upper:.3f}]"
+        )
+        fig_ci = px.histogram(boot_means, nbins=20, title="Bootstrap Distribution of Mean Predictions")
+        st.plotly_chart(fig_ci)
