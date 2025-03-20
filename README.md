@@ -1,18 +1,18 @@
-# Credit Card Fraud Detection
+# 💳 Credit Card Fraud Detection
 
-## Description
+## 📋 Description
 This project implements a fraud detection system for credit card transactions using advanced data analysis and machine learning techniques. The system includes an interactive web interface built with Streamlit to facilitate data analysis, visualization, and model-driven insights.
 
-## Features
-- Exploratory analysis of transaction data
-- Feature engineering for fraud detection
-- Training and comparison of multiple ML models
-- Interactive visualizations and dashboards
-- Model explainability with SHAP and LIME techniques
-- Risk threshold adjustments for fraud detection
-- Real-time transaction monitoring and inference
+## ✨ Features
+- 📊 Exploratory analysis of transaction data
+- 🛠️ Feature engineering for fraud detection
+- 🤖 Training and comparison of multiple ML models
+- 📈 Interactive visualizations and dashboards
+- 🔍 Model explainability with SHAP and LIME techniques
+- ⚖️ Risk threshold adjustments for fraud detection
+- 🔄 Real-time transaction monitoring and inference
 
-## Project Structure
+## 📁 Project Structure
 ```
 ├── app/                    # Streamlit application
 │   ├── pages/              # Application pages
@@ -38,7 +38,7 @@ This project implements a fraud detection system for credit card transactions us
 └── fictitious_credit_card_transactions.csv  # Sample data file
 ```
 
-## Installation
+## 🚀 Installation
 ```bash
 # Clone the repository
 git clone https://github.com/[seu-username]/fraud-credit.git
@@ -52,83 +52,83 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Usage
+## 🔧 Usage
 ```bash
 # Run the Streamlit application
 cd app
 streamlit run app.py
 ```
 
-## Demo Videos
+## 🎬 Demo Videos
 
-### Initial Project Demo
+### 🎥 Initial Project Demo
 This video demonstrates the initial version of the fraud detection system:
 [Watch Initial Demo](https://drive.google.com/file/d/16K7kBDLYZsRexCD35zrR7IBiBnUaYxC1/view?usp=sharing)
 
-### Final Project Demo
+### 🎥 Final Project Demo
 This video shows the completed project with all features implemented:
 [Watch Final Demo](https://drive.google.com/file/d/1729n_4bUDQtDTbXMlMNT2wHQIx2kc0w_/view?usp=sharing)
 
-## Technical Features
+## 🔧 Technical Features
 
-### Processing Pipelines
+### 🔄 Processing Pipelines
 The system uses `sklearn.pipeline.Pipeline` to create reproducible processing flows:
-- Consistent data preprocessing
-- Transformation of categorical and numerical features
-- Automatic extraction of temporal characteristics
-- Use of SMOTE for class balancing
+- ✅ Consistent data preprocessing
+- 🔄 Transformation of categorical and numerical features
+- ⏱️ Automatic extraction of temporal characteristics
+- ⚖️ Use of SMOTE for class balancing
 
-### Model Registry System
+### 📊 Model Registry System
 A complete model versioning system has been implemented:
-- Storage of multiple model versions
-- Registration of hyperparameters and performance metrics
-- Traceability of used features
-- API to select the best model by metric
+- 💾 Storage of multiple model versions
+- 📝 Registration of hyperparameters and performance metrics
+- 🔍 Traceability of used features
+- 🔌 API to select the best model by metric
 
-### Advanced Features for Fraud Detection
+### 🚩 Advanced Features for Fraud Detection
 We implemented advanced features specific to fraud:
-- Transaction velocity analysis
-- Behavioral pattern detection
-- Temporal anomaly identification
-- Composite fraud risk score
+- ⚡ Transaction velocity analysis
+- 👤 Behavioral pattern detection
+- 🕒 Temporal anomaly identification
+- 🎯 Composite fraud risk score
 
-### Responsive Interface
+### 💻 Responsive Interface
 The Streamlit application has a modern and responsive interface:
-- Interactive dashboard with dark theme
-- Real-time monitoring capabilities
-- Risk threshold adjustments with immediate visual feedback
-- Transaction fraud scoring with detailed explanations
+- 🌃 Interactive dashboard with dark theme
+- 📊 Real-time monitoring capabilities
+- 🎚️ Risk threshold adjustments with immediate visual feedback
+- 🔢 Transaction fraud scoring with detailed explanations
 
-## Dataset
+## 📊 Dataset
 The project includes a sample fictitious credit card transaction dataset containing:
-- Transaction information (amount, date, status)
-- Merchant data (ID, category, location)
-- Card information (brand, issuing bank)
-- Fraud indicator (target)
+- 💰 Transaction information (amount, date, status)
+- 🏪 Merchant data (ID, category, location)
+- 💳 Card information (brand, issuing bank)
+- 🚨 Fraud indicator (target)
 
 Users can upload their own data or use the built-in synthetic data generator.
 
-## Implemented Models
-- Logistic Regression
-- Random Forest
-- XGBoost
-- LightGBM
-- Model Ensemble (Voting)
+## 🤖 Implemented Models
+- 📊 Logistic Regression
+- 🌲 Random Forest
+- 🚀 XGBoost
+- 💡 LightGBM
+- 🤝 Model Ensemble (Voting)
 
-## How to Contribute
+## 🤝 How to Contribute
 Contributions are welcome! Follow these steps:
 
-1. Fork the project
-2. Create a branch for your feature (`git checkout -b feature/new-feature`)
-3. Commit the changes (`git commit -m 'Add new feature'`)
-4. Push to the remote repository (`git push origin feature/new-feature`)
-5. Open a Pull Request
+1. 🍴 Fork the project
+2. 🌿 Create a branch for your feature (`git checkout -b feature/new-feature`)
+3. 💾 Commit the changes (`git commit -m 'Add new feature'`)
+4. 📤 Push to the remote repository (`git push origin feature/new-feature`)
+5. 🔃 Open a Pull Request
 
-### Areas for contribution
-- Implementation of new detection algorithms
-- Improvement of existing visualizations
-- Performance optimization
-- Documentation and tutorials
+### 🎯 Areas for contribution
+- 🧠 Implementation of new detection algorithms
+- 📊 Improvement of existing visualizations
+- ⚡ Performance optimization
+- 📚 Documentation and tutorials
 
-## License
+## 📄 License
 This project is licensed under the MIT license - see the LICENSE file for details.
