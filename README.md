@@ -59,6 +59,16 @@ cd app
 streamlit run app.py
 ```
 
+## Demo Videos
+
+### Initial Project Demo
+This video demonstrates the initial version of the fraud detection system:
+[Watch Initial Demo](https://drive.google.com/file/d/16K7kBDLYZsRexCD35zrR7IBiBnUaYxC1/view?usp=sharing)
+
+### Final Project Demo
+This video shows the completed project with all features implemented:
+[Watch Final Demo](https://drive.google.com/file/d/1729n_4bUDQtDTbXMlMNT2wHQIx2kc0w_/view?usp=sharing)
+
 ## Technical Features
 
 ### Processing Pipelines
