@@ -14,6 +14,8 @@ import seaborn as sns
 from datetime import datetime, timedelta
 from contextlib import nullcontext
 import io
+import requests
+from PIL import Image
 
 # Add project root to path for relative imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1081,8 +1083,18 @@ def display_monitoring_dashboard(df):
             from matplotlib.patches import Rectangle
             
             fig, ax = plt.subplots(figsize=(10, 6))
-            img = plt.imread('https://raw.githubusercontent.com/matplotlib/basemap/main/examples/st-helens.jpg')  # Placeholder image
-            ax.imshow(img, extent=[-180, 180, -90, 90], alpha=0.8)
+            
+            try:
+                # Load image from URL correctly using requests and PIL
+                response = requests.get('https://raw.githubusercontent.com/matplotlib/basemap/main/examples/st-helens.jpg')
+                image = Image.open(io.BytesIO(response.content))
+                img = np.array(image)
+                ax.imshow(img, extent=[-180, 180, -90, 90], alpha=0.8)
+            except Exception as e:
+                st.warning(f"Could not load map image: {e}. Using a plain background instead.")
+                # Create a simple blue background as fallback
+                ax.set_facecolor('#EAEAF2')  # Light blue background
+                ax.grid(True, linestyle='--', alpha=0.7)
             
             # Simulated hotspots (longitude, latitude, intensity)
             hotspots = [
