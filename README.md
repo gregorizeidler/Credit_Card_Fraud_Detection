@@ -1,16 +1,16 @@
 # Credit Card Fraud Detection
 
 ## Description
-This project implements a fraud detection system for credit card transactions using advanced data analysis and machine learning techniques. The system includes an interactive web interface built with Streamlit to facilitate data analysis, visualization, and modeling.
+This project implements a fraud detection system for credit card transactions using advanced data analysis and machine learning techniques. The system includes an interactive web interface built with Streamlit to facilitate data analysis, visualization, and model-driven insights.
 
 ## Features
 - Exploratory analysis of transaction data
 - Feature engineering for fraud detection
 - Training and comparison of multiple ML models
 - Interactive visualizations and dashboards
-- Model explainability with SHAP and other techniques
-- "What-if" simulations to understand behaviors
-- Generation of exportable reports
+- Model explainability with SHAP and LIME techniques
+- Risk threshold adjustments for fraud detection
+- Real-time transaction monitoring and inference
 
 ## Project Structure
 ```
@@ -26,30 +26,22 @@ This project implements a fraud detection system for credit card transactions us
 ├── models/                 # ML models
 │   ├── training.py         # Model training
 │   ├── evaluation.py       # Performance evaluation
-│   ├── model_registry.py   # Model registry and versioning system
-│   └── saved/              # Saved trained models
+│   └── model_registry.py   # Model registry and versioning system
 ├── features/               # Feature engineering
 │   ├── creation.py         # Basic feature creation
 │   ├── selection.py        # Feature selection
 │   └── advanced_features.py # Advanced features for fraud detection
-├── visualization/          # Visualizations
-│   ├── exploratory.py      # Exploratory visualizations
-│   └── model_viz.py        # Model visualizations
 ├── utils/                  # Utility functions and classes
-│   ├── metrics.py          # Custom metrics
-│   ├── config_utils.py     # Configuration utilities
-│   └── helpers.py          # Helper functions
-├── tests/                  # Unit and integration tests
-├── notebooks/              # Jupyter notebooks for analysis
+│   └── config_utils.py     # Configuration utilities
 ├── requirements.txt        # Python dependencies
-├── setup.py                # Package configuration
-└── config.yaml             # Configuration file
+├── config.yaml             # Configuration file
+└── fictitious_credit_card_transactions.csv  # Sample data file
 ```
 
 ## Installation
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/fraud-credit.git
+git clone https://github.com/[seu-username]/fraud-credit.git
 cd fraud-credit
 
 # Create virtual environment
@@ -63,10 +55,8 @@ pip install -r requirements.txt
 ## Usage
 ```bash
 # Run the Streamlit application
-streamlit run app/app.py
-
-# To use a specific theme (light/dark)
-# Add ?theme=dark to the browser URL (e.g., http://localhost:8501/?theme=dark)
+cd app
+streamlit run app.py
 ```
 
 ## Technical Features
@@ -94,17 +84,19 @@ We implemented advanced features specific to fraud:
 
 ### Responsive Interface
 The Streamlit application has a modern and responsive interface:
-- Adaptable design for different devices
-- Configurable light/dark theme
-- Animations and visual feedback
-- Interactive and intuitive components
+- Interactive dashboard with dark theme
+- Real-time monitoring capabilities
+- Risk threshold adjustments with immediate visual feedback
+- Transaction fraud scoring with detailed explanations
 
 ## Dataset
-The project uses a credit card transaction dataset containing:
+The project includes a sample fictitious credit card transaction dataset containing:
 - Transaction information (amount, date, status)
 - Merchant data (ID, category, location)
 - Card information (brand, issuing bank)
 - Fraud indicator (target)
+
+Users can upload their own data or use the built-in synthetic data generator.
 
 ## Implemented Models
 - Logistic Regression
@@ -127,7 +119,6 @@ Contributions are welcome! Follow these steps:
 - Improvement of existing visualizations
 - Performance optimization
 - Documentation and tutorials
-- New automated test sets
 
 ## License
 This project is licensed under the MIT license - see the LICENSE file for details.
